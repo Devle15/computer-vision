@@ -35,7 +35,7 @@ def convolve2d(img, kernel):
 
 def _as_theta_range(theta_range):
     if theta_range is None:
-        return (-90.0, 90.0)
+        return (0.0, 180.0)
     if isinstance(theta_range, (tuple, list, np.ndarray)) and len(theta_range) == 2:
         return float(theta_range[0]), float(theta_range[1])
     raise ValueError("theta_range must be a 2-item tuple/list")
@@ -48,6 +48,63 @@ def _as_rho_range(rho_range, edges):
     if isinstance(rho_range, (tuple, list, np.ndarray)) and len(rho_range) == 2:
         return float(rho_range[0]), float(rho_range[1])
     raise ValueError("rho_range must be a 2-item tuple/list")
+
+
+def _normalize_theta(theta):
+    return np.mod(theta, np.pi)
+
+
+def _angle_diff(theta_a, theta_b):
+    diff = np.abs(np.mod(theta_a - theta_b + np.pi / 2.0, np.pi) - np.pi / 2.0)
+    return diff
+
+
+def _gaussian_kernel(sigma):
+    radius = max(1, int(np.ceil(3.0 * sigma)))
+    size = 2 * radius + 1
+    ax = np.arange(-radius, radius + 1, dtype=np.float64)
+    xx, yy = np.meshgrid(ax, ax)
+    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma * sigma))
+    kernel /= np.sum(kernel)
+    return kernel
+
+
+def _smooth_accumulator(A, sigma):
+    if sigma is None or sigma <= 0:
+        return A.copy()
+    kernel = _gaussian_kernel(float(sigma))
+    return convolve2d(A, kernel)
+
+
+def _local_maxima(filtered, radius):
+    h, w = filtered.shape
+    peak_mask = np.zeros_like(filtered, dtype=bool)
+    for i in range(h):
+        i0 = max(0, i - radius)
+        i1 = min(h, i + radius + 1)
+        for j in range(w):
+            j0 = max(0, j - radius)
+            j1 = min(w, j + radius + 1)
+            patch = filtered[i0:i1, j0:j1]
+            if filtered[i, j] == np.max(patch) and filtered[i, j] > 0:
+                peak_mask[i, j] = True
+    return peak_mask
+
+
+def _theta_windows(theta_center, delta_theta):
+    low = theta_center - delta_theta
+    high = theta_center + delta_theta
+    windows = []
+    if low >= 0.0 and high <= np.pi:
+        windows.append((low, high, 1.0))
+    else:
+        if low < 0.0:
+            windows.append((0.0, high, 1.0))
+            windows.append((np.pi + low, np.pi, -1.0))
+        if high > np.pi:
+            windows.append((low, np.pi, 1.0))
+            windows.append((0.0, high - np.pi, -1.0))
+    return windows
 
 
 def hough_accumulate(edges, theta_range, rho_range,
@@ -70,6 +127,9 @@ def hough_accumulate(edges, theta_range, rho_range,
         raise ValueError("n_rho must be positive")
 
     thetas = np.deg2rad(np.linspace(theta_min, theta_max, n_theta, endpoint=False))
+    thetas = _normalize_theta(thetas)
+    thetas = np.sort(thetas)
+    rhos = np.linspace(rho_min, rho_max, n_rho, endpoint=True)
     drho = (rho_max - rho_min) / n_rho if n_rho > 1 else 1.0
     acc = np.zeros((n_rho, n_theta), dtype=np.float64)
 
@@ -81,15 +141,15 @@ def hough_accumulate(edges, theta_range, rho_range,
 
     y_idx, x_idx = np.nonzero(edges > 0)
     if y_idx.size == 0:
-        return acc
+        return acc, thetas, rhos
 
     for y, x in zip(y_idx, x_idx):
         if grad_dir_arr is not None:
             angle_deg = float(grad_dir_arr[y, x])
-            orient = np.deg2rad(angle_deg + 90.0)
+            orient = _normalize_theta(np.deg2rad(angle_deg))
             if delta_deg is not None:
                 delta = np.deg2rad(float(delta_deg))
-                valid = np.abs(np.angle(np.exp(1j * (thetas - orient)))) <= delta
+                valid = _angle_diff(thetas, orient) <= delta
                 theta_candidates = thetas[valid]
                 if theta_candidates.size == 0:
                     theta_candidates = thetas
@@ -101,59 +161,56 @@ def hough_accumulate(edges, theta_range, rho_range,
         for theta in theta_candidates:
             rho = x * np.cos(theta) + y * np.sin(theta)
             rho_bin = int(np.clip(np.round((rho - rho_min) / drho), 0, n_rho - 1))
-            theta_bin = int(np.clip(np.argmin(np.abs(thetas - theta)), 0, n_theta - 1))
+            theta_bin = int(np.clip(np.argmin(np.abs(_angle_diff(thetas, theta))), 0, n_theta - 1))
             acc[rho_bin, theta_bin] += 1.0
 
-    return acc
+    return acc, thetas, rhos
 
 
-def find_peaks(A, num_peaks=8, nms_radius=6, smooth_sigma=1.0):
-    """Return the strongest local maxima in a 2D accumulator array."""
+def find_peaks(A, thetas=None, rhos=None, num_peaks=8, nms_radius=6, smooth_sigma=1.0):
+    """Return the strongest peaks in a 2D accumulator as (rho, theta, votes)."""
     A = np.asarray(A, dtype=np.float64)
     if A.ndim != 2:
         raise ValueError("A must be a 2D array")
 
+    if thetas is None:
+        thetas = np.arange(A.shape[1], dtype=np.float64)
+    else:
+        thetas = np.asarray(thetas, dtype=np.float64)
+    if rhos is None:
+        rhos = np.arange(A.shape[0], dtype=np.float64)
+    else:
+        rhos = np.asarray(rhos, dtype=np.float64)
+
     if num_peaks <= 0:
-        return np.empty((0, 2), dtype=int)
+        return np.empty((0, 3), dtype=np.float64)
 
-    if smooth_sigma is not None and smooth_sigma > 0:
-        try:
-            from scipy.ndimage import gaussian_filter
-            filtered = gaussian_filter(A, sigma=float(smooth_sigma))
-        except Exception:
-            filtered = A.copy()
-    else:
-        filtered = A.copy()
-
-    if nms_radius is None or nms_radius <= 0:
-        local_max = filtered == filtered.max()
-    else:
-        try:
-            from scipy.ndimage import maximum_filter
-            radius = max(1, int(nms_radius))
-            max_window = maximum_filter(filtered, size=2 * radius + 1, mode='constant')
-            local_max = filtered == max_window
-        except Exception:
-            local_max = np.zeros_like(filtered, dtype=bool)
-            radius = max(1, int(nms_radius))
-            h, w = filtered.shape
-            for i in range(h):
-                i0 = max(0, i - radius)
-                i1 = min(h, i + radius + 1)
-                for j in range(w):
-                    j0 = max(0, j - radius)
-                    j1 = min(w, j + radius + 1)
-                    patch = filtered[i0:i1, j0:j1]
-                    local_max[i, j] = filtered[i, j] == patch.max()
+    filtered = _smooth_accumulator(A, float(smooth_sigma)) if smooth_sigma is not None else A.copy()
+    radius = max(0, int(nms_radius))
+    local_max = _local_maxima(filtered, radius)
 
     if not np.any(local_max):
-        return np.empty((0, 2), dtype=int)
+        return np.empty((0, 3), dtype=np.float64)
 
     ys, xs = np.where(local_max)
     values = filtered[ys, xs]
     order = np.argsort(values)[::-1]
-    peak_idx = np.column_stack((ys[order], xs[order]))[:num_peaks]
-    return peak_idx.astype(int)
+
+    selected = []
+    for idx in order:
+        y, x = ys[idx], xs[idx]
+        if radius > 0 and any(abs(y - sy) <= radius and abs(x - sx) <= radius for sy, sx, _ in selected):
+            continue
+        selected.append((y, x, values[idx]))
+        if len(selected) >= num_peaks:
+            break
+
+    peaks = []
+    for y, x, value in selected:
+        rho = rhos[int(y)]
+        theta = thetas[int(x)]
+        peaks.append((rho, theta, float(value)))
+    return np.asarray(peaks, dtype=np.float64)
 
 
 def hough_multiscale(edges, grad_dir=None,
@@ -197,7 +254,7 @@ def hough_multiscale(edges, grad_dir=None,
             rho_steps = n_rho0
 
         rho_min, rho_max = (-np.hypot(img.shape[0], img.shape[1]), np.hypot(img.shape[0], img.shape[1]))
-        acc = hough_accumulate(
+        acc, thetas_acc, rhos_acc = hough_accumulate(
             img,
             theta_range=(-90.0, 90.0),
             rho_range=(rho_min, rho_max),
@@ -206,18 +263,17 @@ def hough_multiscale(edges, grad_dir=None,
             grad_dir=grad_level_scaled,
             delta_deg=delta_deg
         )
-        peaks = find_peaks(acc, num_peaks=max(1, int(n_peaks)), nms_radius=max(1, int(min(acc.shape) // 20)), smooth_sigma=1.0)
+        peaks = find_peaks(acc, thetas=thetas_acc, rhos=rhos_acc, num_peaks=max(1, int(n_peaks)), nms_radius=max(1, int(min(acc.shape) // 20)), smooth_sigma=1.0)
         if peaks.size == 0:
             continue
 
-        for (rho_idx, theta_idx) in peaks:
-            score = float(acc[rho_idx, theta_idx])
-            all_peaks.append((rho_idx, theta_idx))
+        for rho_peak, theta_peak, score in peaks:
+            all_peaks.append((rho_peak, theta_peak))
             scores.append(score)
 
     if not all_peaks:
-        return np.empty((0, 2), dtype=int)
+        return np.empty((0, 2), dtype=np.float64)
 
     order = np.argsort(scores)[::-1]
-    best = np.asarray([all_peaks[i] for i in order[:max(1, int(n_peaks))]], dtype=int)
+    best = np.asarray([all_peaks[i] for i in order[:max(1, int(n_peaks))]], dtype=np.float64)
     return best[:max(1, int(n_peaks))]
