@@ -107,173 +107,629 @@ def _theta_windows(theta_center, delta_theta):
     return windows
 
 
-def hough_accumulate(edges, theta_range, rho_range,
-                     n_theta=180, n_rho=None,
-                     grad_dir=None, delta_deg=None):
-    """Compute a line Hough accumulator for binary edge data."""
+def hough_accumulate(
+    edges,
+    theta_range,
+    rho_range,
+    n_theta=180,
+    n_rho=None,
+    grad_dir=None,
+    delta_deg=None,
+):
+    """Compute a line Hough accumulator.
+
+    Returns:
+        A      : accumulator of shape (n_rho, n_theta)
+        thetas : theta values in radians, normalized to [0, pi)
+        rhos   : rho values corresponding to accumulator rows
+    """
     edges = np.asarray(edges, dtype=np.float64)
+
     if edges.ndim != 2:
         raise ValueError("edges must be a 2D array")
+
     if n_theta <= 0:
         raise ValueError("n_theta must be positive")
 
-    theta_min, theta_max = _as_theta_range(theta_range)
+    theta_min_deg, theta_max_deg = _as_theta_range(theta_range)
     rho_min, rho_max = _as_rho_range(rho_range, edges)
 
     if n_rho is None:
-        n_rho = max(1, int(np.ceil(np.hypot(edges.shape[0], edges.shape[1]))))
+        n_rho = int(np.ceil(np.hypot(edges.shape[0], edges.shape[1]))) + 1
+
     n_rho = int(n_rho)
+
     if n_rho <= 0:
         raise ValueError("n_rho must be positive")
 
-    thetas = np.deg2rad(np.linspace(theta_min, theta_max, n_theta, endpoint=False))
-    thetas = _normalize_theta(thetas)
-    thetas = np.sort(thetas)
-    rhos = np.linspace(rho_min, rho_max, n_rho, endpoint=True)
-    drho = (rho_max - rho_min) / n_rho if n_rho > 1 else 1.0
+    # Hough convention: theta in [0, pi)
+    theta_min = np.deg2rad(theta_min_deg)
+    theta_max = np.deg2rad(theta_max_deg)
+
+    if theta_max <= theta_min:
+        theta_max += np.pi
+
+    thetas = np.linspace(
+        theta_min,
+        theta_max,
+        n_theta,
+        endpoint=False,
+        dtype=np.float64,
+    )
+
+    thetas = np.mod(thetas, np.pi)
+
+    rhos = np.linspace(
+        rho_min,
+        rho_max,
+        n_rho,
+        endpoint=True,
+        dtype=np.float64,
+    )
+
+    if n_rho > 1:
+        drho = (rho_max - rho_min) / (n_rho - 1)
+    else:
+        drho = 1.0
+
     acc = np.zeros((n_rho, n_theta), dtype=np.float64)
 
-    grad_dir_arr = None
+    # Gradient direction
     if grad_dir is not None:
         grad_dir_arr = np.asarray(grad_dir, dtype=np.float64)
+
         if grad_dir_arr.shape != edges.shape:
-            raise ValueError("grad_dir must have the same shape as edges")
+            raise ValueError(
+                "grad_dir must have the same shape as edges"
+            )
+    else:
+        grad_dir_arr = None
 
     y_idx, x_idx = np.nonzero(edges > 0)
+
     if y_idx.size == 0:
         return acc, thetas, rhos
 
     for y, x in zip(y_idx, x_idx):
+
+        # --------------------------------------------------
+        # Determine theta candidates
+        # --------------------------------------------------
         if grad_dir_arr is not None:
-            angle_deg = float(grad_dir_arr[y, x])
-            orient = _normalize_theta(np.deg2rad(angle_deg))
+
+            grad_theta = _normalize_theta(
+                np.deg2rad(float(grad_dir_arr[y, x]))
+            )
+
             if delta_deg is not None:
+
                 delta = np.deg2rad(float(delta_deg))
-                valid = _angle_diff(thetas, orient) <= delta
+
+                valid = (
+                    _angle_diff(thetas, grad_theta)
+                    <= delta
+                )
+
                 theta_candidates = thetas[valid]
+
                 if theta_candidates.size == 0:
-                    theta_candidates = thetas
+                    continue
+
             else:
                 theta_candidates = thetas
+
         else:
             theta_candidates = thetas
 
+        # --------------------------------------------------
+        # Voting
+        # --------------------------------------------------
         for theta in theta_candidates:
-            rho = x * np.cos(theta) + y * np.sin(theta)
-            rho_bin = int(np.clip(np.round((rho - rho_min) / drho), 0, n_rho - 1))
-            theta_bin = int(np.clip(np.argmin(np.abs(_angle_diff(thetas, theta))), 0, n_theta - 1))
+
+            rho = (
+                x * np.cos(theta)
+                + y * np.sin(theta)
+            )
+
+            rho_bin = int(
+                np.clip(
+                    np.round(
+                        (rho - rho_min) / drho
+                    ),
+                    0,
+                    n_rho - 1,
+                )
+            )
+
+            theta_bin = int(
+                np.argmin(
+                    _angle_diff(thetas, theta)
+                )
+            )
+
             acc[rho_bin, theta_bin] += 1.0
 
     return acc, thetas, rhos
 
 
-def find_peaks(A, thetas=None, rhos=None, num_peaks=8, nms_radius=6, smooth_sigma=1.0):
-    """Return the strongest peaks in a 2D accumulator as (rho, theta, votes)."""
+def find_peaks(
+    A,
+    thetas=None,
+    rhos=None,
+    num_peaks=8,
+    nms_radius=6,
+    smooth_sigma=1.0,
+):
+    """Return strongest Hough peaks as (rho, theta, votes)."""
     A = np.asarray(A, dtype=np.float64)
+
     if A.ndim != 2:
         raise ValueError("A must be a 2D array")
 
     if thetas is None:
-        thetas = np.arange(A.shape[1], dtype=np.float64)
+        thetas = np.arange(
+            A.shape[1],
+            dtype=np.float64,
+        )
     else:
-        thetas = np.asarray(thetas, dtype=np.float64)
+        thetas = np.asarray(
+            thetas,
+            dtype=np.float64,
+        )
+
     if rhos is None:
-        rhos = np.arange(A.shape[0], dtype=np.float64)
+        rhos = np.arange(
+            A.shape[0],
+            dtype=np.float64,
+        )
     else:
-        rhos = np.asarray(rhos, dtype=np.float64)
+        rhos = np.asarray(
+            rhos,
+            dtype=np.float64,
+        )
+
+    if len(thetas) != A.shape[1]:
+        raise ValueError(
+            "thetas length must match A.shape[1]"
+        )
+
+    if len(rhos) != A.shape[0]:
+        raise ValueError(
+            "rhos length must match A.shape[0]"
+        )
 
     if num_peaks <= 0:
-        return np.empty((0, 3), dtype=np.float64)
+        return np.empty(
+            (0, 3),
+            dtype=np.float64,
+        )
 
-    filtered = _smooth_accumulator(A, float(smooth_sigma)) if smooth_sigma is not None else A.copy()
-    radius = max(0, int(nms_radius))
-    local_max = _local_maxima(filtered, radius)
+    # Smooth ONLY for locating peaks.
+    filtered = _smooth_accumulator(
+        A,
+        float(smooth_sigma),
+    ) if smooth_sigma is not None else A.copy()
+
+    radius = max(
+        0,
+        int(nms_radius),
+    )
+
+    local_max = _local_maxima(
+        filtered,
+        radius,
+    )
 
     if not np.any(local_max):
-        return np.empty((0, 3), dtype=np.float64)
+        return np.empty(
+            (0, 3),
+            dtype=np.float64,
+        )
 
     ys, xs = np.where(local_max)
+
+    # Rank by smoothed response
     values = filtered[ys, xs]
-    order = np.argsort(values)[::-1]
+    order = np.argsort(
+        values
+    )[::-1]
 
     selected = []
+
     for idx in order:
-        y, x = ys[idx], xs[idx]
-        if radius > 0 and any(abs(y - sy) <= radius and abs(x - sx) <= radius for sy, sx, _ in selected):
+
+        y = int(ys[idx])
+        x = int(xs[idx])
+
+        # NMS
+        too_close = False
+
+        if radius > 0:
+            for sy, sx in selected:
+                if (
+                    abs(y - sy) <= radius
+                    and abs(x - sx) <= radius
+                ):
+                    too_close = True
+                    break
+
+        if too_close:
             continue
-        selected.append((y, x, values[idx]))
+
+        selected.append(
+            (y, x)
+        )
+
         if len(selected) >= num_peaks:
             break
 
     peaks = []
-    for y, x, value in selected:
-        rho = rhos[int(y)]
-        theta = thetas[int(x)]
-        peaks.append((rho, theta, float(value)))
-    return np.asarray(peaks, dtype=np.float64)
+
+    for y, x in selected:
+
+        rho = float(rhos[y])
+        theta = float(thetas[x])
+
+        # IMPORTANT:
+        # votes come from original accumulator,
+        # not the smoothed accumulator.
+        votes = float(A[y, x])
+
+        peaks.append(
+            (rho, theta, votes)
+        )
+
+    if not peaks:
+        return np.empty(
+            (0, 3),
+            dtype=np.float64,
+        )
+
+    return np.asarray(
+        peaks,
+        dtype=np.float64,
+    )
 
 
-def hough_multiscale(edges, grad_dir=None,
-                     n_peaks=8, n_levels=2,
-                     refine_factor=8,
-                     n_theta0=180, n_rho0=None,
-                     delta_deg=None):
-    """Run a coarse-to-fine Hough search and collect the strongest peaks."""
-    edges = np.asarray(edges, dtype=np.float64)
+def hough_multiscale(
+    edges,
+    grad_dir=None,
+    n_peaks=8,
+    n_levels=2,
+    refine_factor=8,
+    n_theta0=180,
+    n_rho0=None,
+    delta_deg=None,
+):
+    """Coarse-to-fine Hough transform.
+
+    Level 0:
+        Build a coarse accumulator over the full space.
+
+    Later levels:
+        Refine only around the peaks detected at the
+        previous level.
+    """
+    edges = np.asarray(
+        edges,
+        dtype=np.float64,
+    )
+
     if edges.ndim != 2:
-        raise ValueError("edges must be a 2D array")
+        raise ValueError(
+            "edges must be a 2D array"
+        )
+
     if n_levels <= 0:
-        return np.empty((0, 2), dtype=int)
+        return np.empty(
+            (0, 2),
+            dtype=np.float64,
+        )
+
+    if refine_factor <= 1:
+        raise ValueError(
+            "refine_factor must be > 1"
+        )
+
+    # ------------------------------------------------------
+    # Gradient direction
+    # ------------------------------------------------------
+    if grad_dir is not None:
+        grad_dir_arr = np.asarray(
+            grad_dir,
+            dtype=np.float64,
+        )
+
+        if grad_dir_arr.shape != edges.shape:
+            raise ValueError(
+                "grad_dir must match edges shape"
+            )
+    else:
+        grad_dir_arr = None
+
+    # ------------------------------------------------------
+    # Full rho range
+    # ------------------------------------------------------
+    H, W = edges.shape
+
+    D = float(
+        np.hypot(H, W)
+    )
 
     if n_rho0 is None:
-        n_rho0 = max(1, int(np.ceil(np.hypot(edges.shape[0], edges.shape[1]))))
+        n_rho0 = int(
+            np.ceil(2 * D)
+        ) + 1
 
-    all_peaks = []
-    scores = []
-    grad_level = None
-    if grad_dir is not None:
-        grad_level = np.asarray(grad_dir, dtype=np.float64)
-        if grad_level.shape != edges.shape:
-            raise ValueError("grad_dir must match the shape of edges")
+    # ------------------------------------------------------
+    # LEVEL 0: coarse Hough
+    # ------------------------------------------------------
+    acc, thetas, rhos = hough_accumulate(
+        edges,
+        theta_range=(0.0, 180.0),
+        rho_range=(-D, D),
+        n_theta=n_theta0,
+        n_rho=n_rho0,
+        grad_dir=grad_dir_arr,
+        delta_deg=delta_deg,
+    )
 
-    for level in range(n_levels):
-        scale = 2 ** level
-        if scale > 1:
-            img = edges[::scale, ::scale]
-            if grad_level is not None:
-                grad_level_scaled = grad_level[::scale, ::scale]
-            else:
-                grad_level_scaled = None
-        else:
-            img = edges
-            grad_level_scaled = grad_level
+    peaks = find_peaks(
+        acc,
+        thetas=thetas,
+        rhos=rhos,
+        num_peaks=n_peaks,
+        nms_radius=max(
+            1,
+            int(min(acc.shape) // 20),
+        ),
+        smooth_sigma=1.0,
+    )
 
-        theta_steps = max(10, int(n_theta0 // (refine_factor ** level)))
-        rho_steps = max(1, int(n_rho0 // (refine_factor ** max(level, 1))))
-        if rho_steps <= 0:
-            rho_steps = n_rho0
-
-        rho_min, rho_max = (-np.hypot(img.shape[0], img.shape[1]), np.hypot(img.shape[0], img.shape[1]))
-        acc, thetas_acc, rhos_acc = hough_accumulate(
-            img,
-            theta_range=(-90.0, 90.0),
-            rho_range=(rho_min, rho_max),
-            n_theta=theta_steps,
-            n_rho=rho_steps,
-            grad_dir=grad_level_scaled,
-            delta_deg=delta_deg
+    if peaks.size == 0:
+        return np.empty(
+            (0, 2),
+            dtype=np.float64,
         )
-        peaks = find_peaks(acc, thetas=thetas_acc, rhos=rhos_acc, num_peaks=max(1, int(n_peaks)), nms_radius=max(1, int(min(acc.shape) // 20)), smooth_sigma=1.0)
-        if peaks.size == 0:
-            continue
 
-        for rho_peak, theta_peak, score in peaks:
-            all_peaks.append((rho_peak, theta_peak))
-            scores.append(score)
+    # ------------------------------------------------------
+    # Initial resolution
+    # ------------------------------------------------------
+    if len(thetas) > 1:
+        delta_theta = (
+            np.pi / n_theta0
+        )
+    else:
+        delta_theta = np.pi
 
-    if not all_peaks:
-        return np.empty((0, 2), dtype=np.float64)
+    if len(rhos) > 1:
+        delta_rho = (
+            rhos[1] - rhos[0]
+        )
+    else:
+        delta_rho = 1.0
 
-    order = np.argsort(scores)[::-1]
-    best = np.asarray([all_peaks[i] for i in order[:max(1, int(n_peaks))]], dtype=np.float64)
-    return best[:max(1, int(n_peaks))]
+    # ------------------------------------------------------
+    # REFINEMENT LEVELS
+    # ------------------------------------------------------
+    for level in range(1, n_levels):
+
+        refined_peaks = []
+
+        # Each new level is refine_factor times finer.
+        new_delta_theta = (
+            delta_theta / refine_factor
+        )
+
+        new_delta_rho = (
+            delta_rho / refine_factor
+        )
+
+        for rho_center, theta_center, _ in peaks:
+
+            # --------------------------------------------------
+            # Edge points that contributed to coarse peak
+            # --------------------------------------------------
+            y_idx, x_idx = np.nonzero(
+                edges > 0
+            )
+
+            if y_idx.size == 0:
+                continue
+
+            coarse_rho = (
+                x_idx * np.cos(theta_center)
+                + y_idx * np.sin(theta_center)
+            )
+
+            candidate_mask = (
+                np.abs(
+                    coarse_rho - rho_center
+                )
+                <= delta_rho
+            )
+
+            selected_y = y_idx[
+                candidate_mask
+            ]
+
+            selected_x = x_idx[
+                candidate_mask
+            ]
+
+            if selected_y.size == 0:
+                continue
+
+            local_edges = np.zeros_like(
+                edges,
+                dtype=np.float64,
+            )
+
+            local_edges[
+                selected_y,
+                selected_x
+            ] = 1.0
+
+            # --------------------------------------------------
+            # Handle theta wrap-around
+            # --------------------------------------------------
+            windows = _theta_windows(
+                float(theta_center),
+                float(delta_theta),
+            )
+
+            window_candidates = []
+
+            for (
+                theta_low,
+                theta_high,
+                rho_sign,
+            ) in windows:
+
+                theta_width = (
+                    theta_high - theta_low
+                )
+
+                if theta_width <= 0:
+                    continue
+
+                n_theta_local = max(
+                    3,
+                    int(
+                        np.ceil(
+                            theta_width
+                            / new_delta_theta
+                        )
+                    ) + 1,
+                )
+
+                # Convert to degrees for hough_accumulate
+                low_deg = np.rad2deg(
+                    theta_low
+                )
+
+                high_deg = np.rad2deg(
+                    theta_high
+                )
+
+                rho_center_local = (
+                    float(rho_center)
+                    * rho_sign
+                )
+
+                rho_min_local = (
+                    rho_center_local
+                    - delta_rho
+                )
+
+                rho_max_local = (
+                    rho_center_local
+                    + delta_rho
+                )
+
+                n_rho_local = max(
+                    3,
+                    int(
+                        np.ceil(
+                            (rho_max_local
+                             - rho_min_local)
+                            / new_delta_rho
+                        )
+                    ) + 1,
+                )
+
+                grad_local = grad_dir_arr
+
+                local_acc, local_thetas, local_rhos = (
+                    hough_accumulate(
+                        local_edges,
+                        theta_range=(
+                            low_deg,
+                            high_deg,
+                        ),
+                        rho_range=(
+                            rho_min_local,
+                            rho_max_local,
+                        ),
+                        n_theta=n_theta_local,
+                        n_rho=n_rho_local,
+                        grad_dir=grad_local,
+                        delta_deg=delta_deg,
+                    )
+                )
+
+                local_peaks = find_peaks(
+                    local_acc,
+                    thetas=local_thetas,
+                    rhos=local_rhos,
+                    num_peaks=1,
+                    nms_radius=1,
+                    smooth_sigma=1.0,
+                )
+
+                if local_peaks.size:
+                    rho_new = (
+                        local_peaks[0, 0]
+                        * rho_sign
+                    )
+
+                    theta_new = (
+                        local_peaks[0, 1]
+                    )
+
+                    votes_new = (
+                        local_peaks[0, 2]
+                    )
+
+                    window_candidates.append(
+                        (
+                            rho_new,
+                            theta_new,
+                            votes_new,
+                        )
+                    )
+
+            if window_candidates:
+                best = max(
+                    window_candidates,
+                    key=lambda p: p[2],
+                )
+
+                refined_peaks.append(
+                    best
+                )
+
+        if not refined_peaks:
+            break
+
+        # --------------------------------------------------
+        # Keep strongest peaks
+        # --------------------------------------------------
+        refined_peaks = sorted(
+            refined_peaks,
+            key=lambda p: p[2],
+            reverse=True,
+        )
+
+        peaks = np.asarray(
+            refined_peaks[:n_peaks],
+            dtype=np.float64,
+        )
+
+        # Prepare finer resolution
+        delta_theta = new_delta_theta
+        delta_rho = new_delta_rho
+
+    # ------------------------------------------------------
+    # Return only (rho, theta)
+    # ------------------------------------------------------
+    if peaks.size == 0:
+        return np.empty(
+            (0, 2),
+            dtype=np.float64,
+        )
+
+    return np.asarray(
+        peaks[:, :2],
+        dtype=np.float64,
+    )
